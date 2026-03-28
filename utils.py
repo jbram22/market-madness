@@ -2,7 +2,11 @@ import requests
 import numpy as np
 import pandas as pd
 
-COLS = ["quarter_finals", "semi_finals", "finals", "championship"]
+# COLS = ["quarter_finals", "semi_finals", "finals", "championship"]
+
+# adjusted according to rounds, dont include smoothing 
+# for probs = 1
+COLS = ["semi_finals", "finals", "championship"]
 
 
 # helper to get team name from question
@@ -43,6 +47,7 @@ def construct_round_map(slug):
 # will need to update as tourny progresses, 
 # but same w rest of code really
 def concatenate_data(qf_map, sf_map, f_map, chip_map):
+    
     import pandas as pd
 
     # Use sf_map as the base universe
@@ -82,6 +87,9 @@ def compute_ev_df():
     sf_map = construct_round_map("ncaa-tournament-team-to-make-semifinals")
     f_map = construct_round_map("ncaa-tournament-team-to-make-national-championship")
     chip_map = construct_round_map("2026-ncaa-tournament-winner")
+    
+    # maps will effectively become empty as teams progress
+    # for example, qf_map is empty now that we're in elite 8
 
     # concatenate
     df = concatenate_data(qf_map, sf_map, f_map, chip_map)
@@ -93,14 +101,15 @@ def compute_ev_df():
     assert (df["finals"] > df["championship"]).all()
 
     # compute p(losing in particular round)
-    df["lose_in_qf"] = df["quarter_finals"] - df["semi_finals"]
+#     df["lose_in_qf"] = df["quarter_finals"] - df["semi_finals"]
+    df["lose_in_qf"] = 1 - df["semi_finals"] # necessary change
     df["lose_in_sf"] = df["semi_finals"] - df["finals"]
     df["lose_in_finals"] = df["finals"] - df["championship"]
-
+    
 
     df["total_prob"] = (
-        (1 - df["quarter_finals"]) +   # lose before QF
-        df["lose_in_qf"] +
+        (1 - df["quarter_finals"]) +   # lose before QF (this will automatically adjust to 0 as teams advance)
+        df['lose_in_qf'] + # lose in QF
         df["lose_in_sf"] +
         df["lose_in_finals"] +
         df["championship"]
@@ -110,20 +119,12 @@ def compute_ev_df():
     assert (df["total_prob"] - 1 < 1e-13).all()
 
     df["EV"] = (
-        4 * (1 - df["quarter_finals"]) +
+        4 * (1 - df["quarter_finals"]) + # this will automatically adjust to 0 since p = 1 as teams advance
         8 * df["lose_in_qf"] +
         16 * df["lose_in_sf"] +
         32 * df["lose_in_finals"] +
         64 * df["championship"]
     )
 
+
     return df
-
-
-
-
-
-
-
-
-
