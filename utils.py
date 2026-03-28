@@ -50,8 +50,9 @@ def concatenate_data(qf_map, sf_map, f_map, chip_map):
     
     import pandas as pd
 
-    # Use sf_map as the base universe
-    teams = sorted(sf_map.keys())
+    # Use chip as the base universe
+    # easiest way to determine whose alive
+    teams = sorted(chip_map.keys())
 
     df = pd.DataFrame({
         "team": teams,
