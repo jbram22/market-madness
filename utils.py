@@ -20,14 +20,22 @@ def construct_round_map(slug):
         if (not market["closed"]) and market['active']:
             question = market.get('question')
             if "Team" not in question:
-                bid = float(market["bestBid"])
-                ask = float(market["bestAsk"])
-                mid = (bid + ask) / 2
                 if "winner" in slug:
                     team = question.split("Will ")[1].split(" win")[0]
                 else:
                     team = extract_team(question)
-                hashmap[team] = mid
+                
+                # annoying thing for uconn
+                if team == "Connecticut":
+                    team = "UConn"
+
+                try: # this also takes care of teams not alive
+                    bid = float(market["bestBid"])
+                    ask = float(market["bestAsk"])
+                    mid = (bid + ask) / 2
+                    hashmap[team] = mid
+                except:
+                    pass
     return hashmap
 
 
