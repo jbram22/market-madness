@@ -56,7 +56,7 @@ def concatenate_data(qf_map, sf_map, f_map, chip_map):
     df = pd.DataFrame({
         "team": teams,
         "quarter_finals": [qf_map.get(t, 0) if t in qf_map else 1 for t in teams],
-        "semi_finals": [sf_map.get(t, 0) for t in teams],
+        "semi_finals": [sf_map.get(t, 0) if t in sf_map else 1 for t in teams],
         "finals": [f_map.get(t, 0) for t in teams],
         "championship": [chip_map.get(t, 0) for t in teams]
     })
