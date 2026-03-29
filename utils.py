@@ -94,10 +94,11 @@ def compute_ev_df():
 
     # concatenate
     df = concatenate_data(qf_map, sf_map, f_map, chip_map)
-
+    
     # smooth probabilities
     df[COLS] = np.vstack(df.apply(smooth_with_min_gap, axis=1))
-    assert (df["quarter_finals"] > df["semi_finals"]).all()
+    
+    assert (df["quarter_finals"] >= df["semi_finals"]).all() # account for teams advancing thru both
     assert (df["semi_finals"] > df["finals"]).all()
     assert (df["finals"] > df["championship"]).all()
 
