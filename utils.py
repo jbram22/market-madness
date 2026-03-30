@@ -6,7 +6,7 @@ import pandas as pd
 
 # adjusted according to rounds, dont include smoothing 
 # for probs = 1
-COLS = ["semi_finals", "finals", "championship"]
+COLS = ["finals", "championship"]
 
 
 # helper to get team name from question
@@ -105,12 +105,13 @@ def compute_ev_df():
     # compute p(losing in particular round)
 #     df["lose_in_qf"] = df["quarter_finals"] - df["semi_finals"]
     df["lose_in_qf"] = 1 - df["semi_finals"] # necessary change
-    df["lose_in_sf"] = df["semi_finals"] - df["finals"]
+    # df["lose_in_sf"] = df["semi_finals"] - df["finals"]
+    df["lose_in_sf"] = 1 - df["finals"] # change as we progress (now going into final 4)
     df["lose_in_finals"] = df["finals"] - df["championship"]
     
 
     df["total_prob"] = (
-        (1 - df["quarter_finals"]) +   # lose before QF (this will automatically adjust to 0 as teams advance)
+        (1 - df["quarter_finals"]) +   # lose before QF ie sweet 16 (this will automatically adjust to 0 as teams advance)
         df['lose_in_qf'] + # lose in QF
         df["lose_in_sf"] +
         df["lose_in_finals"] +
