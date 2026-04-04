@@ -58,7 +58,7 @@ def concatenate_data(qf_map, sf_map, f_map, chip_map):
         "team": teams,
         "quarter_finals": [qf_map.get(t, 0) if t in qf_map else 1 for t in teams],
         "semi_finals": [sf_map.get(t, 0) if t in sf_map else 1 for t in teams],
-        "finals": [f_map.get(t, 0) for t in teams],
+        "finals": [f_map.get(t, 0) if t in f_map else 1 for t in teams],
         "championship": [chip_map.get(t, 0) for t in teams]
     })
 
@@ -99,8 +99,8 @@ def compute_ev_df():
     df[COLS] = np.vstack(df.apply(smooth_with_min_gap, axis=1))
     
     assert (df["quarter_finals"] >= df["semi_finals"]).all() # account for teams advancing thru both
-    assert (df["semi_finals"] > df["finals"]).all()
-    assert (df["finals"] > df["championship"]).all()
+    assert (df["semi_finals"] >= df["finals"]).all() # advancing to semis
+    assert (df["finals"] >= df["championship"]).all() # advancing to finals
 
     # compute p(losing in particular round)
 #     df["lose_in_qf"] = df["quarter_finals"] - df["semi_finals"]
