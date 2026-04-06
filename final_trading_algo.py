@@ -15,9 +15,11 @@ from trading_client import *
 
 
 # global params
+
 ALPHA = 0.80              # weight toward market
 DELTA = 2.0               # total spread width
-K_INV = 1.25              # inventory skew strength
+K_INV = 3.0               # inventory skew strength
+# K_INV = 1.25              # inventory skew strength
 MAX_POSITION = 60
 
 EDGE_THRESHOLD = 1.0
@@ -42,9 +44,7 @@ if not logger.handlers:
 # logging.disable(logging.CRITICAL)
 
 
-# =========================
-# HELPERS
-# =========================
+# helpers
 
 def round_to_tick(px: float, tick_size: float = TICK_SIZE, side: str | None = None) -> float:
     """
@@ -178,9 +178,7 @@ def build_quotes(row):
     })
 
 
-# =========================
-# BOT
-# =========================
+# client 
 
 class TradingBot(Client):
     def __init__(
@@ -238,7 +236,7 @@ class TradingBot(Client):
                 axis=1,
             )
 
-            # -------- cancel all open orders every iteration --------
+            # cancel all open orders every iteration
             logger.info("-------- CANCELING ALL OPEN ORDERS --------")
             current_open_orders = await self.get_open_orders()
             if current_open_orders:
@@ -247,7 +245,7 @@ class TradingBot(Client):
                 except Exception as e:
                     logger.info(f"Failed to cancel open orders: {e}")
 
-            # -------- place fresh quotes --------
+            # place fresh quotes 
             logger.info("-------- SENDING NEW ORDERS --------")
             order_type = "LIMIT"
 
