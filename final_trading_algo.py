@@ -14,25 +14,36 @@ sys.path.append(os.path.abspath("trading-simulator-client"))
 from trading_client import *
 
 
-# global params
+# =========================
+# GLOBAL PARAMS
+# =========================
 
-ALPHA = 0.80              # weight toward market
-DELTA = 2.0               # total spread width
-K_INV = 2.5               # inventory skew strength
-# K_INV = 1.25              # inventory skew strength
+ALPHA = 0.80
+DELTA = 2.0
+K_INV = 2.5
 MAX_POSITION = 60
 
 EDGE_THRESHOLD = 1.0
 EDGE_PCT_THRESHOLD = 0.10
 
 BASE_SIZE = 20
-EDGE_SCALE = 10.0
+EDGE_SCALE = 5.0
 
 TICK_SIZE = 0.01
 SLEEP_SECONDS = 30
 
+# disagreement / confidence controls
+MAX_DISAGREE_SCORE = 5.0
+DISAGREE_INCREMENT = 1.0
+DISAGREE_DECAY = 0.5
+MIN_CONFIDENCE = 0.25
+CONFIDENCE_SLOPE = 0.15
 
-# logging
+
+# =========================
+# LOGGING
+# =========================
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -40,21 +51,16 @@ if not logger.handlers:
     handler = logging.StreamHandler(sys.stdout)
     handler.setFormatter(logging.Formatter("%(levelname)s - %(message)s"))
     logger.addHandler(handler)
-# disable all non-critical (omit for now, uncomment for execution)
+
+# Uncomment for debugging if needed
 # logging.disable(logging.CRITICAL)
 
 
-# helpers
+# =========================
+# HELPERS
+# =========================
 
-def round_to_tick(px: float, tick_size: float = TICK_SIZE, side: str | None = None) -> float:
-    """
-    Round a price to the exchange tick.
-
-    side:
-        - 'BUY'  -> round down so you do not bid more than intended
-        - 'SELL' -> round up so you do not offer lower than intended
-        - None   -> round to nearest tick
-    """
+def round_to_tick(px: float, tick_size: float = TICK_SIZE, side=None) -> float:
     if pd.isna(px):
         return px
 
@@ -67,9 +73,6 @@ def round_to_tick(px: float, tick_size: float = TICK_SIZE, side: str | None = No
 
 
 def mid_price_map(order_books, fair_values):
-    """
-    Compute mid prices only for teams where we have fair values.
-    """
     asks, bids, out = {}, {}, {}
     for team in fair_values:
         book = order_books[team]
@@ -79,16 +82,32 @@ def mid_price_map(order_books, fair_values):
     return asks, bids, out
 
 
+def thesis_disagreement(raw_edge: float, price_change: float) -> bool:
+    """
+    Disagreement means the market is moving farther away from your model value.
+
+    If raw_edge > 0, your model says market is too cheap.
+    If price falls further, disagreement increases.
+
+    If raw_edge < 0, your model says market is too expensive.
+    If price rises further, disagreement increases.
+    """
+    if pd.isna(price_change) or raw_edge == 0:
+        return False
+    return (raw_edge > 0 and price_change < 0) or (raw_edge < 0 and price_change > 0)
+
+
+def score_to_confidence(score: float) -> float:
+    """
+    score 0 -> confidence 1.0
+    score 5 -> confidence bottoms near MIN_CONFIDENCE
+    """
+    return max(MIN_CONFIDENCE, 1.0 - CONFIDENCE_SLOPE * score)
+
+
 def compute_quote_sizes(edge: float, position: int) -> tuple[int, int]:
     """
-    Returns (bid_size, ask_size).
-
-    Logic:
-    - scale with edge magnitude
-    - if move is adverse, reduce aggression
-    - if already long, reduce bids and preserve/encourage asks
-    - if already short, reduce asks and preserve/encourage bids
-    - enforce hard inventory caps
+    Returns (bid_size, ask_size), using effective edge.
     """
     edge_strength = min(abs(edge) / EDGE_SCALE, 1.0)
     base = BASE_SIZE * edge_strength
@@ -99,18 +118,14 @@ def compute_quote_sizes(edge: float, position: int) -> tuple[int, int]:
     ask_size = 0.0
 
     if edge > 0:
-        # Model likes owning more, but inventory still matters.
-        # As long inventory grows, reduce bids sharply.
+        # Model likes being longer, but reduce buying as inventory grows
         bid_size = base * (1.0 - pos_ratio)
         ask_size = base * (0.5 + 0.5 * pos_ratio)
-
     elif edge < 0:
-        # Model likes being shorter, but inventory still matters.
-        # As short inventory grows, reduce asks sharply.
+        # Model likes being shorter, but reduce selling as inventory grows
         bid_size = base * (0.5 + 0.5 * pos_ratio)
         ask_size = base * (1.0 - pos_ratio)
 
-    # Hard caps
     if position >= MAX_POSITION:
         bid_size = 0.0
     if position <= -MAX_POSITION:
@@ -121,29 +136,25 @@ def compute_quote_sizes(edge: float, position: int) -> tuple[int, int]:
 
 def build_quotes(row):
     """
-    Build inventory-aware bid/ask quotes for one symbol.
+    Build quotes using effective fair value, not raw model fair value.
     """
-    fair_value = row["fair_value"]
+    fair_value = row["effective_fair_value"]
     market_price = row["market_price"]
     position = row["position"]
     best_ask = row["best_ask"]
     best_bid = row["best_bid"]
 
-    # One unified quote center formula
+    # quote center
     mid_quote = fair_value + ALPHA * (market_price - fair_value)
 
-    # Inventory skew
+    # inventory skew
     pos_ratio = position / MAX_POSITION
     skew = K_INV * pos_ratio
 
     bid_quote = mid_quote - DELTA / 2 - skew
     ask_quote = mid_quote + DELTA / 2 - skew
 
-    # asymmetric quoting (ie not just even spacing on either side of mid)
-
-    # mellow enforcement, should allow
-    # you to not have to dump inventory at
-    # worse price than entrance
+    # softer asymmetry
     if position > 0:
         bid_quote -= 0.3 * (DELTA / 2)
         ask_quote -= 0.1 * (DELTA / 2)
@@ -151,25 +162,12 @@ def build_quotes(row):
         bid_quote += 0.1 * (DELTA / 2)
         ask_quote += 0.3 * (DELTA / 2)
 
-    # # use below when accumulating too much inventory
-    # # but comment out when closing positions
-    # # at worse price than entering into 
-    # if position > 0:
-    #     bid_quote -= 0.5 * (DELTA / 2)
-    #     ask_quote -= 0.2 * (DELTA / 2)
-    # elif position < 0:
-    #     bid_quote += 0.2 * (DELTA / 2)
-    #     ask_quote += 0.5 * (DELTA / 2)
-
     bid_quote = round_to_tick(bid_quote, TICK_SIZE, side="BUY")
     ask_quote = round_to_tick(ask_quote, TICK_SIZE, side="SELL")
 
-    # always ensure ask is greater than highest bid
+    # remain passive
     ask_quote = max(ask_quote, best_bid + TICK_SIZE)
-
-    # always ensure bid is less than lowest ask
     bid_quote = min(bid_quote, best_ask - TICK_SIZE)
-
 
     return pd.Series({
         "mid_quote": mid_quote,
@@ -178,7 +176,9 @@ def build_quotes(row):
     })
 
 
-# client 
+# =========================
+# BOT
+# =========================
 
 class TradingBot(Client):
     def __init__(
@@ -190,6 +190,8 @@ class TradingBot(Client):
         super().__init__(session, game_id, token)
 
     async def on_start(self) -> None:
+        prev_prices = {}
+        disagree_score = {}
 
         while True:
             order_books = await self.get_order_books()
@@ -203,40 +205,71 @@ class TradingBot(Client):
             common_teams = sorted(set(fair_values) & set(market_prices))
 
             df = pd.DataFrame({"team": common_teams})
-            df["fair_value"] = df["team"].map(fair_values)
+            df["model_fair_value"] = df["team"].map(fair_values)
             df["best_ask"] = df["team"].map(asks)
             df["best_bid"] = df["team"].map(bids)
             df["market_price"] = df["team"].map(market_prices)
             df["position"] = df["team"].map(lambda t: positions.get(t, 0))
 
-            # -------- edge --------
-            df["edge"] = df["fair_value"] - df["market_price"]
-            df["edge_pct"] = df["edge"] / df["market_price"]
+            # -------- raw model edge --------
+            df["raw_edge"] = df["model_fair_value"] - df["market_price"]
+            df["raw_edge_pct"] = df["raw_edge"] / df["market_price"]
 
+            # -------- price change --------
+            df["prev_price"] = df["team"].map(lambda t: prev_prices.get(t, pd.NA))
+            df["price_change"] = df["market_price"] - df["prev_price"]
+
+            # -------- disagreement score update --------
+            for _, row in df.iterrows():
+                team = row["team"]
+                old_score = disagree_score.get(team, 0.0)
+
+                if thesis_disagreement(row["raw_edge"], row["price_change"]):
+                    new_score = min(old_score + DISAGREE_INCREMENT, MAX_DISAGREE_SCORE)
+                else:
+                    new_score = max(old_score - DISAGREE_DECAY, 0.0)
+
+                disagree_score[team] = new_score
+
+            df["disagree_score"] = df["team"].map(lambda t: disagree_score.get(t, 0.0))
+            df["confidence"] = df["disagree_score"].apply(score_to_confidence)
+
+            # -------- effective fair value / effective edge --------
+            df["effective_fair_value"] = (
+                df["market_price"] +
+                df["confidence"] * (df["model_fair_value"] - df["market_price"])
+            )
+            df["effective_edge"] = df["effective_fair_value"] - df["market_price"]
+            df["effective_edge_pct"] = df["effective_edge"] / df["market_price"]
+
+            # -------- trade filter --------
             df["trade_candidate"] = (
-                (df["edge"].abs() > EDGE_THRESHOLD) |
-                (df["edge_pct"].abs() > EDGE_PCT_THRESHOLD)
+                (df["effective_edge"].abs() > EDGE_THRESHOLD) |
+                (df["effective_edge_pct"].abs() > EDGE_PCT_THRESHOLD)
             )
 
             df = df[df["trade_candidate"]].copy()
 
             # -------- quotes --------
             quote_df = df.apply(build_quotes, axis=1)
-
             df = pd.concat([df, quote_df], axis=1)
 
             # -------- sizes --------
             df[["bid_size", "ask_size"]] = df.apply(
                 lambda row: pd.Series(
                     compute_quote_sizes(
-                        edge=row["edge"],
+                        edge=row["effective_edge"],
                         position=row["position"],
                     )
                 ),
                 axis=1,
             )
 
-            # cancel all open orders every iteration
+            # -------- update price memory --------
+            for team, px in zip(df["team"], df["market_price"]):
+                prev_prices[team] = px
+
+            # -------- cancel all open orders every iteration --------
             logger.info("-------- CANCELING ALL OPEN ORDERS --------")
             current_open_orders = await self.get_open_orders()
             if current_open_orders:
@@ -245,37 +278,40 @@ class TradingBot(Client):
                 except Exception as e:
                     logger.info(f"Failed to cancel open orders: {e}")
 
-            # place fresh quotes 
+            # -------- place fresh quotes --------
             logger.info("-------- SENDING NEW ORDERS --------")
             order_type = "LIMIT"
 
             for _, row in df.iterrows():
                 team = row["team"]
-                market_price = row["market_price"]
-                edge = row["edge"]
 
                 bid_quote = row["bid_quote"]
                 ask_quote = row["ask_quote"]
                 bid_size = int(row["bid_size"])
                 ask_size = int(row["ask_size"])
 
+                logger.info(
+                    f"{team:12s} | "
+                    f"ModelFV: {row['model_fair_value']:.2f} | "
+                    f"EffFV: {row['effective_fair_value']:.2f} | "
+                    f"Mkt: {row['market_price']:.2f} | "
+                    f"RawEdge: {row['raw_edge']:.2f} | "
+                    f"EffEdge: {row['effective_edge']:.2f} | "
+                    f"Conf: {row['confidence']:.2f} | "
+                    f"Pos: {row['position']:3d} | "
+                    f"BidPx: {bid_quote:.2f} x {bid_size:2d} | "
+                    f"AskPx: {ask_quote:.2f} x {ask_size:2d}"
+                )
+
                 if bid_size > 0:
                     try:
                         await self.send_order(team, bid_quote, bid_size, order_type)
-                        logger.info(
-                            f"BUY  | Team: {team:12s} | Qty: {bid_size:3d} | "
-                            f"Market: {market_price:.2f} | Px: {bid_quote:.2f} | Edge: {edge:.2f}"
-                        )
                     except Exception as e:
                         logger.info(f"Failed to place BUY for {team}: {e}")
 
                 if ask_size > 0:
                     try:
                         await self.send_order(team, ask_quote, -ask_size, order_type)
-                        logger.info(
-                            f"SELL | Team: {team:12s} | Qty: {ask_size:3d} | "
-                            f"Market: {market_price:.2f} | Px: {ask_quote:.2f} | Edge: {edge:.2f}"
-                        )
                     except Exception as e:
                         logger.info(f"Failed to place SELL for {team}: {e}")
 
