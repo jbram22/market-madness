@@ -18,7 +18,7 @@ from trading_client import *
 
 ALPHA = 0.80              # weight toward market
 DELTA = 2.0               # total spread width
-K_INV = 3.0               # inventory skew strength
+K_INV = 2.5               # inventory skew strength
 # K_INV = 1.25              # inventory skew strength
 MAX_POSITION = 60
 
@@ -141,25 +141,25 @@ def build_quotes(row):
 
     # asymmetric quoting (ie not just even spacing on either side of mid)
 
-    # # mellow enforcement, should allow
-    # # you to not have to dump inventory at
-    # # worse price than entrance
-    # if position > 0:
-    #     bid_quote -= 0.3 * (DELTA / 2)
-    #     ask_quote -= 0.1 * (DELTA / 2)
-    # elif position < 0:
-    #     bid_quote += 0.1 * (DELTA / 2)
-    #     ask_quote += 0.3 * (DELTA / 2)
-
-    # use below when accumulating too much inventory
-    # but comment out when closing positions
-    # at worse price than entering into 
+    # mellow enforcement, should allow
+    # you to not have to dump inventory at
+    # worse price than entrance
     if position > 0:
-        bid_quote -= 0.5 * (DELTA / 2)
-        ask_quote -= 0.2 * (DELTA / 2)
+        bid_quote -= 0.3 * (DELTA / 2)
+        ask_quote -= 0.1 * (DELTA / 2)
     elif position < 0:
-        bid_quote += 0.2 * (DELTA / 2)
-        ask_quote += 0.5 * (DELTA / 2)
+        bid_quote += 0.1 * (DELTA / 2)
+        ask_quote += 0.3 * (DELTA / 2)
+
+    # # use below when accumulating too much inventory
+    # # but comment out when closing positions
+    # # at worse price than entering into 
+    # if position > 0:
+    #     bid_quote -= 0.5 * (DELTA / 2)
+    #     ask_quote -= 0.2 * (DELTA / 2)
+    # elif position < 0:
+    #     bid_quote += 0.2 * (DELTA / 2)
+    #     ask_quote += 0.5 * (DELTA / 2)
 
     bid_quote = round_to_tick(bid_quote, TICK_SIZE, side="BUY")
     ask_quote = round_to_tick(ask_quote, TICK_SIZE, side="SELL")
