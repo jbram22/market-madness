@@ -18,12 +18,22 @@ from trading_client import *
 # GLOBAL PARAMS
 # =========================
 
+# mid and sizing 
 ALPHA = 0.80
 K_INV = 1.5
 MAX_POSITION = 60
+
+# dynamic delta controls
 MIN_DELTA = 0.30
-MAX_DELTA = 1.20
-DELTA_MULTIPLIER = 0.7
+MAX_DELTA = 1.00
+DELTA_MULTIPLIER = 0.75
+
+# favored-side aggressiveness controls
+JOIN_EDGE_THRESHOLD = 0.8
+IMPROVE_EDGE_THRESHOLD = 1.5
+MIN_CONFIDENCE_TO_IMPROVE = 0.8
+MAX_POS_RATIO_TO_IMPROVE = 0.15
+UNFAVORED_JOIN_EDGE_THRESHOLD = 1.2
 
 EDGE_THRESHOLD = 0.5
 EDGE_PCT_THRESHOLD = 0.10
@@ -168,8 +178,22 @@ def compute_quote_sizes(edge: float, position: int) -> tuple[int, int]:
 
 
 def build_quotes(row):
+    """
+    Build quotes using effective fair value plus book-aware aggressiveness.
+
+    Behavior:
+    - Compute a theoretical raw quote around effective fair value
+    - Apply inventory skew and mild asymmetry
+    - Use dynamic per-team delta based on market spread
+    - Favored side can join or improve
+    - Unfavored side can join softly when conditions are good enough
+    - Stay passive (never cross)
+    """
     fair_value = row["effective_fair_value"]
     market_price = row["market_price"]
+    effective_edge = row["effective_edge"]
+    confidence = row["confidence"]
+
     position = row["position"]
     best_ask = row["best_ask"]
     best_bid = row["best_bid"]
@@ -177,14 +201,18 @@ def build_quotes(row):
     spread = best_ask - best_bid
     delta_dynamic = max(MIN_DELTA, min(MAX_DELTA, DELTA_MULTIPLIER * spread))
 
+    # quote center
     mid_quote = fair_value + ALPHA * (market_price - fair_value)
 
+    # inventory skew
     pos_ratio = position / MAX_POSITION
+    pos_ratio_abs = abs(position) / MAX_POSITION
     skew = K_INV * pos_ratio
 
     raw_bid_quote = mid_quote - delta_dynamic / 2 - skew
     raw_ask_quote = mid_quote + delta_dynamic / 2 - skew
 
+    # mild asymmetry
     if position > 0:
         raw_bid_quote -= 0.3 * (delta_dynamic / 2)
         raw_ask_quote -= 0.1 * (delta_dynamic / 2)
@@ -195,11 +223,69 @@ def build_quotes(row):
     raw_bid_quote = round_to_tick(raw_bid_quote, TICK_SIZE, side="BUY")
     raw_ask_quote = round_to_tick(raw_ask_quote, TICK_SIZE, side="SELL")
 
-    bid_quote = min(raw_bid_quote, best_ask - TICK_SIZE)
-    ask_quote = max(raw_ask_quote, best_bid + TICK_SIZE)
+    # start from theoretical quotes
+    bid_quote = raw_bid_quote
+    ask_quote = raw_ask_quote
 
-    bid_clipped = bid_quote != raw_bid_quote
-    ask_clipped = ask_quote != raw_ask_quote
+    join_mode = "NONE"
+    improve_mode = "NONE"
+
+    # -----------------------------
+    # Favored-side join / improve
+    # -----------------------------
+    if effective_edge > 0:
+        # favored side = bid
+        if (
+            abs(effective_edge) >= IMPROVE_EDGE_THRESHOLD
+            and confidence >= MIN_CONFIDENCE_TO_IMPROVE
+            and pos_ratio_abs <= MAX_POS_RATIO_TO_IMPROVE
+            and best_bid + TICK_SIZE < best_ask
+        ):
+            bid_quote = best_bid + TICK_SIZE
+            improve_mode = "BID"
+        elif abs(effective_edge) >= JOIN_EDGE_THRESHOLD:
+            bid_quote = best_bid
+            join_mode = "BID"
+
+        # softened unfavored side = ask
+        if (
+            abs(effective_edge) <= UNFAVORED_JOIN_EDGE_THRESHOLD
+            and confidence >= MIN_CONFIDENCE_TO_IMPROVE
+            and position <= 0  # don't make asks too aggressive if already long
+        ):
+            ask_quote = min(ask_quote, best_ask)
+
+    elif effective_edge < 0:
+        # favored side = ask
+        if (
+            abs(effective_edge) >= IMPROVE_EDGE_THRESHOLD
+            and confidence >= MIN_CONFIDENCE_TO_IMPROVE
+            and pos_ratio_abs <= MAX_POS_RATIO_TO_IMPROVE
+            and best_ask - TICK_SIZE > best_bid
+        ):
+            ask_quote = best_ask - TICK_SIZE
+            improve_mode = "ASK"
+        elif abs(effective_edge) >= JOIN_EDGE_THRESHOLD:
+            ask_quote = best_ask
+            join_mode = "ASK"
+
+        # softened unfavored side = bid
+        if (
+            abs(effective_edge) <= UNFAVORED_JOIN_EDGE_THRESHOLD
+            and confidence >= MIN_CONFIDENCE_TO_IMPROVE
+            and position >= 0  # don't make bids too aggressive if already short
+        ):
+            bid_quote = max(bid_quote, best_bid)
+
+    # final passive guardrails
+    bid_quote = min(bid_quote, best_ask - TICK_SIZE)
+    ask_quote = max(ask_quote, best_bid + TICK_SIZE)
+
+    bid_quote = round_to_tick(bid_quote, TICK_SIZE, side="BUY")
+    ask_quote = round_to_tick(ask_quote, TICK_SIZE, side="SELL")
+
+    bid_clipped = bid_quote != raw_bid_quote and join_mode == "NONE" and improve_mode != "BID"
+    ask_clipped = ask_quote != raw_ask_quote and join_mode == "NONE" and improve_mode != "ASK"
 
     return pd.Series({
         "spread": spread,
@@ -211,6 +297,8 @@ def build_quotes(row):
         "ask_quote": ask_quote,
         "bid_clipped": bid_clipped,
         "ask_clipped": ask_clipped,
+        "join_mode": join_mode,
+        "improve_mode": improve_mode,
     })
 
 
@@ -220,6 +308,8 @@ def trace_row(row):
         f"{row['team']:12s} | "
         f"Pos={int(row['position']):4d} | "
         f"Book={fmt(row['best_bid'])}/{fmt(row['best_ask'])} | "
+        f"Spr={fmt(row['spread'])} | "
+        f"Delta={fmt(row['delta_dynamic'])} | "
         f"Mkt={fmt(row['market_price'])} | "
         f"ModelFV={fmt(row['model_fair_value'])} | "
         f"RawEdge={fmt(row['raw_edge'])} | "
@@ -235,9 +325,9 @@ def trace_row(row):
         f"RawQ={fmt(row['raw_bid_quote'])}/{fmt(row['raw_ask_quote'])} | "
         f"FinalQ={fmt(row['bid_quote'])} x {int(row['bid_size'])} / "
         f"{fmt(row['ask_quote'])} x {int(row['ask_size'])} | "
+        f"Join={row['join_mode']} | "
+        f"Improve={row['improve_mode']} | "
         f"Clipped={row['bid_clipped']}/{row['ask_clipped']}"
-        f"Spr={fmt(row['spread'])} | "
-        f"Delta={fmt(row['delta_dynamic'])} | "
     )
 
 
