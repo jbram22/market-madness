@@ -39,6 +39,9 @@ DISAGREE_DECAY = 0.5
 MIN_CONFIDENCE = 0.25
 CONFIDENCE_SLOPE = 0.15
 
+# inventory exit controls
+INVENTORY_EXIT_THRESHOLD = 1
+
 # diagnostics
 TRACE_ENABLED = True
 
@@ -55,7 +58,6 @@ if not logger.handlers:
     handler.setFormatter(logging.Formatter("%(levelname)s - %(message)s"))
     logger.addHandler(handler)
 
-# Prevent duplicate logs from propagating to root logger
 logger.propagate = False
 
 
@@ -128,6 +130,8 @@ def score_to_confidence(score: float) -> float:
 def compute_quote_sizes(edge: float, position: int) -> tuple[int, int]:
     """
     Returns (bid_size, ask_size) using effective edge.
+
+    Risk-increasing side shrinks faster via squared decay.
     """
     edge_strength = min(abs(edge) / EDGE_SCALE, 1.0)
     base = BASE_SIZE * edge_strength
@@ -138,12 +142,12 @@ def compute_quote_sizes(edge: float, position: int) -> tuple[int, int]:
     ask_size = 0.0
 
     if edge > 0:
-        # model wants to be shorter
+        # model wants to be longer
         bid_size = base * (1.0 - pos_ratio) ** 2
         ask_size = base * (0.5 + 0.5 * pos_ratio)
 
     elif edge < 0:
-        # model wants to be longer
+        # model wants to be shorter
         bid_size = base * (0.5 + 0.5 * pos_ratio)
         ask_size = base * (1.0 - pos_ratio) ** 2
 
@@ -221,6 +225,8 @@ def trace_row(row):
         f"Conf={fmt(row['confidence'])} | "
         f"EffFV={fmt(row['effective_fair_value'])} | "
         f"EffEdge={fmt(row['effective_edge'])} | "
+        f"Trade={row['trade_candidate']} | "
+        f"ExitOnly={row['inventory_exit_candidate']} | "
         f"Mid={fmt(row['mid_quote'])} | "
         f"RawQ={fmt(row['raw_bid_quote'])}/{fmt(row['raw_ask_quote'])} | "
         f"FinalQ={fmt(row['bid_quote'])} x {int(row['bid_size'])} / "
@@ -249,15 +255,6 @@ class TradingBot(Client):
         while True:
             order_books = await self.get_order_books()
             positions = self.positions
-
-            # -------- cancel all open orders every iteration --------
-            logger.info("-------- CANCELING ALL OPEN ORDERS --------")
-            current_open_orders = await self.get_open_orders()
-            if current_open_orders:
-                try:
-                    await self.cancel_orders(list(current_open_orders.keys()))
-                except Exception as e:
-                    logger.info(f"Failed to cancel open orders: {e}")
 
             # -------- fair values and market prices --------
             fair_value_df = compute_ev_df()
@@ -310,17 +307,29 @@ class TradingBot(Client):
             df["effective_edge"] = df["effective_fair_value"] - df["market_price"]
             df["effective_edge_pct"] = df["effective_edge"] / df["market_price"]
 
-            # -------- trade filter --------
+            # -------- candidate flags --------
             df["trade_candidate"] = (
                 (df["effective_edge"].abs() > EDGE_THRESHOLD) |
                 (df["effective_edge_pct"].abs() > EDGE_PCT_THRESHOLD)
             )
 
-            df = df[df["trade_candidate"]].copy()
+            df["inventory_exit_candidate"] = (
+                (~df["trade_candidate"]) &
+                (df["position"].abs() >= INVENTORY_EXIT_THRESHOLD)
+            )
 
-            # -------- early exit --------
+            df = df[df["trade_candidate"] | df["inventory_exit_candidate"]].copy()
+
             if df.empty:
-                logger.info("No trade candidates — skipping iteration.")
+                logger.info("No trade or inventory-exit candidates this iteration.")
+                logger.info("-------- CANCELING ALL OPEN ORDERS --------")
+                current_open_orders = await self.get_open_orders()
+                if current_open_orders:
+                    try:
+                        await self.cancel_orders(list(current_open_orders.keys()))
+                    except Exception as e:
+                        logger.info(f"Failed to cancel open orders: {e}")
+
                 await asyncio.sleep(SLEEP_SECONDS)
                 continue
 
@@ -329,15 +338,26 @@ class TradingBot(Client):
             df = pd.concat([df, quote_df], axis=1)
 
             # -------- sizes --------
-            df[["bid_size", "ask_size"]] = df.apply(
-                lambda row: pd.Series(
-                    compute_quote_sizes(
-                        edge=row["effective_edge"],
-                        position=row["position"],
-                    )
+            size_df = df.apply(
+                lambda row: compute_quote_sizes(
+                    edge=row["effective_edge"],
+                    position=row["position"],
                 ),
                 axis=1,
+                result_type="expand",
             )
+            size_df.columns = ["bid_size", "ask_size"]
+            df[["bid_size", "ask_size"]] = size_df
+
+            # -------- inventory-only unwind mode --------
+            for idx, row in df.iterrows():
+                if row["inventory_exit_candidate"]:
+                    if row["position"] > 0:
+                        # long inventory, no alpha left -> only work asks
+                        df.at[idx, "bid_size"] = 0
+                    elif row["position"] < 0:
+                        # short inventory, no alpha left -> only work bids
+                        df.at[idx, "ask_size"] = 0
 
             # -------- trace --------
             if TRACE_ENABLED:
@@ -349,6 +369,14 @@ class TradingBot(Client):
             for team, px in zip(df["team"], df["market_price"]):
                 prev_prices[team] = px
 
+            # -------- cancel all open orders every iteration --------
+            logger.info("-------- CANCELING ALL OPEN ORDERS --------")
+            current_open_orders = await self.get_open_orders()
+            if current_open_orders:
+                try:
+                    await self.cancel_orders(list(current_open_orders.keys()))
+                except Exception as e:
+                    logger.info(f"Failed to cancel open orders: {e}")
 
             # -------- place fresh quotes --------
             logger.info("-------- SENDING NEW ORDERS --------")
@@ -361,6 +389,15 @@ class TradingBot(Client):
                 bid_size = int(row["bid_size"])
                 ask_size = int(row["ask_size"])
 
+                # basic safety checks
+                if row["best_bid"] >= row["best_ask"]:
+                    logger.info(f"Skipping {team}: invalid book.")
+                    continue
+
+                if bid_quote >= ask_quote:
+                    logger.info(f"Skipping {team}: crossed internal quote.")
+                    continue
+
                 if bid_size > 0:
                     try:
                         await self.send_order(team, bid_quote, bid_size, order_type)
@@ -372,8 +409,6 @@ class TradingBot(Client):
                         await self.send_order(team, ask_quote, -ask_size, order_type)
                     except Exception as e:
                         logger.info(f"Failed to place SELL for {team}: {e}")
-
-            print("\n")
 
             await asyncio.sleep(SLEEP_SECONDS)
 
