@@ -41,6 +41,7 @@ CONFIDENCE_SLOPE = 0.15
 
 # inventory exit controls
 INVENTORY_EXIT_THRESHOLD = 1
+MIN_EXIT_SIZE = 1
 
 # diagnostics
 TRACE_ENABLED = True
@@ -352,12 +353,23 @@ class TradingBot(Client):
             # -------- inventory-only unwind mode --------
             for idx, row in df.iterrows():
                 if row["inventory_exit_candidate"]:
-                    if row["position"] > 0:
+                    pos = int(row["position"])
+
+                    if pos > 0:
                         # long inventory, no alpha left -> only work asks
                         df.at[idx, "bid_size"] = 0
-                    elif row["position"] < 0:
+                        df.at[idx, "ask_size"] = min(
+                            pos,
+                            max(MIN_EXIT_SIZE, int(row["ask_size"]))
+                        )
+
+                    elif pos < 0:
                         # short inventory, no alpha left -> only work bids
                         df.at[idx, "ask_size"] = 0
+                        df.at[idx, "bid_size"] = min(
+                            abs(pos),
+                            max(MIN_EXIT_SIZE, int(row["bid_size"]))
+                        )
 
             # -------- trace --------
             if TRACE_ENABLED:
@@ -410,6 +422,7 @@ class TradingBot(Client):
                     except Exception as e:
                         logger.info(f"Failed to place SELL for {team}: {e}")
 
+            print("\n")
             await asyncio.sleep(SLEEP_SECONDS)
 
 
